@@ -1,4 +1,4 @@
-//go:build solaris && !tinygo
+//go:build unix && !(linux || darwin || freebsd || netbsd || dragonfly)
 
 package platform
 
