@@ -157,6 +157,8 @@ func (i *instruction) encode(c backend.Compiler) (needsLabelResolution bool) {
 			legPrex, opcode, opcodeNum = legacyPrefixesNone, 0x0F55, 2
 		case sseOpcodeAndnpd:
 			legPrex, opcode, opcodeNum = legacyPrefixes0x66, 0x0F55, 2
+		case sseOpcodeBlendvb:
+			legPrex, opcode, opcodeNum = legacyPrefixes0x66, 0x0F3810, 3
 		case sseOpcodeBlendvps:
 			legPrex, opcode, opcodeNum = legacyPrefixes0x66, 0x0F3814, 3
 		case sseOpcodeBlendvpd:

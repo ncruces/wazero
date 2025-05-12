@@ -461,6 +461,11 @@ func TestInstruction_format_encode(t *testing.T) {
 			wantFormat: "blendvps %xmm1, %xmm0",
 		},
 		{
+			setup:      func(i *instruction) { i.asXmmRmR(sseOpcodeBlendvb, newOperandReg(xmm1VReg), xmm0VReg) },
+			want:       "660f3810c1",
+			wantFormat: "blendvb %xmm1, %xmm0",
+		},
+		{
 			setup:      func(i *instruction) { i.asXmmUnaryRmR(sseOpcodeCvttps2dq, newOperandReg(xmm1VReg), xmm0VReg) },
 			want:       "f30f5bc1",
 			wantFormat: "cvttps2dq %xmm1, %xmm0",

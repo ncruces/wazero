@@ -3524,27 +3524,20 @@ func (m *machine) lowerVbitselect(instr *ssa.Instruction) {
 	xDef := m.c.ValueDefinition(x)
 	yDef := m.c.ValueDefinition(y)
 	rm, rn := m.getOperand_Reg(xDef), m.getOperand_Reg(yDef)
-	creg := m.getOperand_Reg(m.c.ValueDefinition(c))
 	rd := m.c.VRegOf(instr.Return())
 
-	tmpC := m.copyToTmp(creg.reg())
-	tmpX := m.copyToTmp(rm.reg())
+	tmp0 := m.c.AllocateVReg(ssa.TypeV128)
+	m.copyTo(xmm0VReg, tmp0)
+	m.copyTo(m.c.VRegOf(c), xmm0VReg)
 
-	// And between c, x (overwrites x).
-	pand := m.allocateInstr()
-	pand.asXmmRmR(sseOpcodePand, creg, tmpX)
-	m.insert(pand)
+	tmpY := m.copyToTmp(rn.reg())
 
-	// Andn between y, c (overwrites c).
-	pandn := m.allocateInstr()
-	pandn.asXmmRmR(sseOpcodePandn, rn, tmpC)
-	m.insert(pandn)
+	blend := m.allocateInstr()
+	blend.asXmmRmR(sseOpcodeBlendvb, rm, tmpY)
+	m.insert(blend)
 
-	por := m.allocateInstr()
-	por.asXmmRmR(sseOpcodePor, newOperandReg(tmpC), tmpX)
-	m.insert(por)
-
-	m.copyTo(tmpX, rd)
+	m.copyTo(tmp0, xmm0VReg)
+	m.copyTo(tmpY, rd)
 }
 
 func (m *machine) lowerVFmin(instr *ssa.Instruction) {

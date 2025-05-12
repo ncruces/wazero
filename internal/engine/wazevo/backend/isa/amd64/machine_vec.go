@@ -13,20 +13,12 @@ var swizzleMask = [16]byte{
 }
 
 func (m *machine) lowerSwizzle(x, y ssa.Value, ret ssa.Value) {
-	masklabel := m.getOrAllocateConstLabel(&m.constSwizzleMaskConstIndex, swizzleMask[:])
-
-	// Load mask to maskReg.
-	maskReg := m.c.AllocateVReg(ssa.TypeV128)
-	loadMask := m.allocateInstr().asXmmUnaryRmR(sseOpcodeMovdqu, newOperandMem(m.newAmodeRipRel(masklabel)), maskReg)
-	m.insert(loadMask)
-
 	// Copy x and y to tmp registers.
 	xx := m.getOperand_Reg(m.c.ValueDefinition(x))
 	tmpDst := m.copyToTmp(xx.reg())
 	yy := m.getOperand_Reg(m.c.ValueDefinition(y))
 	tmpX := m.copyToTmp(yy.reg())
 
-	m.insert(m.allocateInstr().asXmmRmR(sseOpcodePaddusb, newOperandReg(maskReg), tmpX))
 	m.insert(m.allocateInstr().asXmmRmR(sseOpcodePshufb, newOperandReg(tmpX), tmpDst))
 
 	// Copy the result to the destination register.
