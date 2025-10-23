@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/tetratelabs/wazero/api"
@@ -235,7 +236,6 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 
 	// Creates new compiler instances which are reused for each function.
 	ssaBuilder := ssa.NewBuilder()
-	fe := frontend.NewFrontendCompiler(module, ssaBuilder, &cm.offsets, ensureTermination, withListener, needSourceInfo)
 	machine := newMachine()
 	be := backend.NewCompiler(ctx, machine, ssaBuilder)
 
@@ -253,33 +253,99 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 	needCallTrampoline := callTrampolineIslandSize > 0
 	var callTrampolineIslandOffsets []int // Holds the offsets of trampoline islands.
 
-	for i := range module.CodeSection {
-		if wazevoapi.DeterministicCompilationVerifierEnabled {
-			i = indexes[i]
-		}
+	type CompiledLocalFuncResult struct {
+		Body             []byte
+		RelsPerFunc      []backend.RelocationInfo
+		IDX              wasm.Index
+		SourceOffsetInfo []backend.SourceOffsetInfo
+	}
 
-		fidx := wasm.Index(i + importedFns)
+	compiledFuncs := make([]CompiledLocalFuncResult, len(module.CodeSection))
 
-		// The iteration ctx may have properties specific to the current local wasm function we are about to compile.
-		// Copy the function's root context as we do not want modify it beyond the scope of this iteration.
-		iterationCtx := ctx
+	workers := experimental.GetCompilationWorkers(ctx)
 
-		if wazevoapi.NeedFunctionNameInContext {
-			def := module.FunctionDefinition(fidx)
-			name := def.DebugName()
-			if len(def.ExportNames()) > 0 {
-				name = def.ExportNames()[0]
+	wg := sync.WaitGroup{}
+	wg.Add(workers)
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	var count atomic.Uint32
+
+	for range workers {
+		go func() {
+			defer wg.Done()
+
+			ssaBuilder := ssa.NewBuilder()
+			machine := newMachine()
+			fe := frontend.NewFrontendCompiler(module, ssaBuilder, &cm.offsets, ensureTermination, withListener, needSourceInfo)
+			be := backend.NewCompiler(ctx, machine, ssaBuilder)
+
+			for {
+				if err := ctx.Err(); err != nil {
+					// Compilation canceled!
+					return
+				}
+
+				i := int(count.Add(1)) - 1
+				if i >= len(module.CodeSection) {
+					return
+				}
+
+				if wazevoapi.DeterministicCompilationVerifierEnabled {
+					i = indexes[i]
+				}
+
+				fidx := wasm.Index(i + importedFns)
+
+				// The iteration ctx may have properties specific to the current local wasm function we are about to compile.
+				// Copy the function's root context as we do not want modify it beyond the scope of this iteration.
+				iterationCtx := ctx
+
+				if wazevoapi.NeedFunctionNameInContext {
+					def := module.FunctionDefinition(fidx)
+					name := def.DebugName()
+					if len(def.ExportNames()) > 0 {
+						name = def.ExportNames()[0]
+					}
+					iterationCtx = wazevoapi.SetCurrentFunctionName(iterationCtx, i,
+						fmt.Sprintf("[%d/%d]%s", i, len(module.CodeSection)-1, name))
+				}
+
+				needListener := len(listeners) > 0 && listeners[i] != nil
+				body, relsPerFunc, err := e.compileLocalWasmFunction(iterationCtx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
+				if err != nil {
+					cancel(fmt.Errorf("compile function %d/%d: %v", i, len(module.CodeSection)-1, err))
+					return
+				}
+				compiledFuncs[i] = CompiledLocalFuncResult{
+					IDX:  fidx,
+					Body: body,
+					// These slices are internal to the backend compiler and since we are going to buffer them instead
+					// of process them immediately we need to copy the memory.
+					RelsPerFunc:      cloneSlice(relsPerFunc),
+					SourceOffsetInfo: cloneSlice(be.SourceOffsetInfo()),
+				}
 			}
-			iterationCtx = wazevoapi.SetCurrentFunctionName(iterationCtx, i,
-				fmt.Sprintf("[%d/%d]%s", i, len(module.CodeSection)-1, name))
-		}
+		}()
+	}
 
-		needListener := len(listeners) > 0 && listeners[i] != nil
-		body, relsPerFunc, err := e.compileLocalWasmFunction(iterationCtx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
-		if err != nil {
-			return nil, fmt.Errorf("compile function %d/%d: %v", i, len(module.CodeSection)-1, err)
-		}
+	wg.Wait()
 
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+
+	var offsetSize int
+	if needSourceInfo {
+		for _, fn := range compiledFuncs {
+			offsetSize += 1 + len(fn.SourceOffsetInfo)
+		}
+		cm.sourceMap.executableOffsets = make([]uintptr, 0, offsetSize)
+		cm.sourceMap.wasmBinaryOffsets = make([]uint64, 0, offsetSize)
+	}
+
+	for i, fn := range compiledFuncs {
 		// Align 16-bytes boundary.
 		totalSize = (totalSize + 15) &^ 15
 		cm.functionOffsets[i] = totalSize
@@ -290,26 +356,26 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 			cm.sourceMap.executableOffsets = append(cm.sourceMap.executableOffsets, uintptr(totalSize))
 			cm.sourceMap.wasmBinaryOffsets = append(cm.sourceMap.wasmBinaryOffsets, module.CodeSection[i].BodyOffsetInCodeSection)
 
-			for _, info := range be.SourceOffsetInfo() {
+			for _, info := range fn.SourceOffsetInfo {
 				cm.sourceMap.executableOffsets = append(cm.sourceMap.executableOffsets, uintptr(totalSize)+uintptr(info.ExecutableOffset))
 				cm.sourceMap.wasmBinaryOffsets = append(cm.sourceMap.wasmBinaryOffsets, uint64(info.SourceOffset))
 			}
 		}
 
-		fref := frontend.FunctionIndexToFuncRef(fidx)
+		fref := frontend.FunctionIndexToFuncRef(fn.IDX)
 		refToBinaryOffset[fref] = totalSize
 
 		// At this point, relocation offsets are relative to the start of the function body,
 		// so we adjust it to the start of the executable.
-		for _, r := range relsPerFunc {
+		for _, r := range fn.RelsPerFunc {
 			r.Offset += int64(totalSize)
 			rels = append(rels, r)
 		}
 
-		bodies[i] = body
-		totalSize += len(body)
+		bodies[i] = fn.Body
+		totalSize += len(fn.Body)
 		if wazevoapi.PrintMachineCodeHexPerFunction {
-			fmt.Printf("[[[machine code for %s]]]\n%s\n\n", wazevoapi.GetCurrentFunctionName(ctx), hex.EncodeToString(body))
+			fmt.Printf("[[[machine code for %s]]]\n%s\n\n", wazevoapi.GetCurrentFunctionName(ctx), hex.EncodeToString(fn.Body))
 		}
 
 		if needCallTrampoline {
