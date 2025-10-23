@@ -206,15 +206,15 @@ func (exec *executables) compileEntryPreambles(m *wasm.Module, machine backend.M
 }
 
 func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listeners []experimental.FunctionListener, ensureTermination bool) (*compiledModule, error) {
+	if module.IsHostModule {
+		return e.compileHostModule(ctx, module, listeners)
+	}
+
 	withListener := len(listeners) > 0
 	cm := &compiledModule{
 		offsets: wazevoapi.NewModuleContextOffsetData(module, withListener), parent: e, module: module,
 		ensureTermination: ensureTermination,
 		executables:       &executables{},
-	}
-
-	if module.IsHostModule {
-		return e.compileHostModule(ctx, module, listeners)
 	}
 
 	importedFns, localFns := int(module.ImportFunctionCount), len(module.FunctionSection)
@@ -225,9 +225,10 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 	rels := make([]backend.RelocationInfo, 0)
 	refToBinaryOffset := make([]int, importedFns+localFns)
 
+	var indexes []int
 	if wazevoapi.DeterministicCompilationVerifierEnabled {
 		// The compilation must be deterministic regardless of the order of functions being compiled.
-		wazevoapi.DeterministicCompilationVerifierRandomizeIndexes(ctx)
+		indexes = wazevoapi.DeterministicCompilationVerifierRandomizeIndexes(ctx)
 	}
 
 	needSourceInfo := module.DWARFLines != nil
@@ -254,9 +255,10 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 
 	for i := range module.CodeSection {
 		if wazevoapi.DeterministicCompilationVerifierEnabled {
-			i = wazevoapi.DeterministicCompilationVerifierGetRandomizedLocalFunctionIndex(ctx, i)
+			i = indexes[i]
 		}
 
+		fctx := ctx
 		fidx := wasm.Index(i + importedFns)
 
 		if wazevoapi.NeedFunctionNameInContext {
@@ -265,11 +267,11 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 			if len(def.ExportNames()) > 0 {
 				name = def.ExportNames()[0]
 			}
-			ctx = wazevoapi.SetCurrentFunctionName(ctx, i, fmt.Sprintf("[%d/%d]%s", i, len(module.CodeSection)-1, name))
+			fctx = wazevoapi.SetCurrentFunctionName(fctx, i, fmt.Sprintf("[%d/%d]%s", i, len(module.CodeSection)-1, name))
 		}
 
 		needListener := len(listeners) > 0 && listeners[i] != nil
-		body, relsPerFunc, err := e.compileLocalWasmFunction(ctx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
+		body, relsPerFunc, err := e.compileLocalWasmFunction(fctx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
 		if err != nil {
 			return nil, fmt.Errorf("compile function %d/%d: %v", i, len(module.CodeSection)-1, err)
 		}
@@ -303,7 +305,7 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 		bodies[i] = body
 		totalSize += len(body)
 		if wazevoapi.PrintMachineCodeHexPerFunction {
-			fmt.Printf("[[[machine code for %s]]]\n%s\n\n", wazevoapi.GetCurrentFunctionName(ctx), hex.EncodeToString(body))
+			fmt.Printf("[[[machine code for %s]]]\n%s\n\n", wazevoapi.GetCurrentFunctionName(fctx), hex.EncodeToString(body))
 		}
 
 		if needCallTrampoline {
@@ -396,9 +398,7 @@ func (e *engine) compileLocalWasmFunction(
 	}
 
 	// TODO: optimize as zero copy.
-	copied := make([]byte, len(original))
-	copy(copied, original)
-	return copied, rels, nil
+	return cloneSlice(original), rels, nil
 }
 
 func (e *engine) compileHostModule(ctx context.Context, module *wasm.Module, listeners []experimental.FunctionListener) (*compiledModule, error) {
@@ -470,9 +470,7 @@ func (e *engine) compileHostModule(ctx context.Context, module *wasm.Module, lis
 		}
 
 		// TODO: optimize as zero copy.
-		copied := make([]byte, len(body))
-		copy(copied, body)
-		bodies[i] = copied
+		bodies[i] = cloneSlice(body)
 		totalSize += len(body)
 	}
 
@@ -834,4 +832,11 @@ func (cm *compiledModule) getSourceOffset(pc uintptr) uint64 {
 		return 0
 	}
 	return cm.sourceMap.wasmBinaryOffsets[index]
+}
+
+func cloneSlice[S ~[]E, E any](s S) S {
+	if s == nil {
+		return nil
+	}
+	return append(S{}, s...)
 }
