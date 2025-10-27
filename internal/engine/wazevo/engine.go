@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/tetratelabs/wazero/api"
@@ -230,11 +231,8 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 
 	needSourceInfo := module.DWARFLines != nil
 
-	// Creates new compiler instances which are reused for each function.
 	ssaBuilder := ssa.NewBuilder()
-	fe := frontend.NewFrontendCompiler(module, ssaBuilder, &cm.offsets, ensureTermination, withListener, needSourceInfo)
 	be := backend.NewCompiler(ctx, machine, ssaBuilder)
-
 	cm.executables.compileEntryPreambles(module, machine, be)
 	cm.functionOffsets = make([]int, localFns)
 
@@ -244,21 +242,96 @@ func (e *engine) compileModule(ctx context.Context, module *wasm.Module, listene
 		indexes = wazevoapi.DeterministicCompilationVerifierRandomizeIndexes(ctx)
 	}
 
-	for i := range module.CodeSection {
-		if wazevoapi.DeterministicCompilationVerifierEnabled {
-			i = indexes[i]
+	if workers := experimental.GetCompilationWorkers(ctx); workers <= 1 {
+		// Compile with a single worker goroutine.
+		fe := frontend.NewFrontendCompiler(module, ssaBuilder, &cm.offsets, ensureTermination, withListener, needSourceInfo)
+
+		for i := range module.CodeSection {
+			if wazevoapi.DeterministicCompilationVerifierEnabled {
+				i = indexes[i]
+			}
+
+			fidx := wasm.Index(i + importedFns)
+			fctx := functionContext(ctx, module, i, fidx)
+
+			needListener := len(listeners) > i && listeners[i] != nil
+			body, relsPerFunc, err := e.compileLocalWasmFunction(fctx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
+			if err != nil {
+				return nil, fmt.Errorf("compile function %d/%d: %v", i, len(module.CodeSection)-1, err)
+			}
+
+			relocator.append(fctx, module, cm, i, fidx, body, relsPerFunc, be.SourceOffsetInfo())
+		}
+	} else {
+		// Compile with N worker goroutines.
+		type compiledFunc struct {
+			fctx        context.Context
+			fnum        int
+			fidx        wasm.Index
+			body        []byte
+			relsPerFunc []backend.RelocationInfo
+			offsPerFunc []backend.SourceOffsetInfo
 		}
 
-		fidx := wasm.Index(i + importedFns)
-		fctx := functionContext(ctx, module, i, fidx)
+		compiledFuncs := make([]compiledFunc, len(module.CodeSection))
+		ctx, cancel := context.WithCancelCause(ctx)
+		defer cancel(nil)
 
-		needListener := len(listeners) > i && listeners[i] != nil
-		body, relsPerFunc, err := e.compileLocalWasmFunction(fctx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
-		if err != nil {
-			return nil, fmt.Errorf("compile function %d/%d: %v", i, len(module.CodeSection)-1, err)
+		var count atomic.Uint32
+		var wg sync.WaitGroup
+		wg.Add(workers)
+
+		for range workers {
+			go func() {
+				defer wg.Done()
+				machine := newMachine()
+				ssaBuilder := ssa.NewBuilder()
+				be := backend.NewCompiler(ctx, machine, ssaBuilder)
+				fe := frontend.NewFrontendCompiler(module, ssaBuilder, &cm.offsets, ensureTermination, withListener, needSourceInfo)
+
+				for {
+					if err := ctx.Err(); err != nil {
+						// Compilation canceled!
+						return
+					}
+
+					i := int(count.Add(1)) - 1
+					if i >= len(module.CodeSection) {
+						return
+					}
+
+					if wazevoapi.DeterministicCompilationVerifierEnabled {
+						i = indexes[i]
+					}
+
+					fidx := wasm.Index(i + importedFns)
+					fctx := functionContext(ctx, module, i, fidx)
+
+					needListener := len(listeners) > i && listeners[i] != nil
+					body, relsPerFunc, err := e.compileLocalWasmFunction(fctx, module, wasm.Index(i), fe, ssaBuilder, be, needListener)
+					if err != nil {
+						cancel(fmt.Errorf("compile function %d/%d: %v", i, len(module.CodeSection)-1, err))
+						return
+					}
+
+					compiledFuncs[i] = compiledFunc{
+						fctx, i, fidx, body,
+						cloneSlice(relsPerFunc),
+						cloneSlice(be.SourceOffsetInfo()),
+					}
+				}
+			}()
 		}
 
-		relocator.append(fctx, module, cm, i, fidx, body, relsPerFunc, be.SourceOffsetInfo())
+		wg.Wait()
+		if err := context.Cause(ctx); err != nil {
+			return nil, err
+		}
+
+		for i := range compiledFuncs {
+			fn := &compiledFuncs[i]
+			relocator.append(fn.fctx, module, cm, fn.fnum, fn.fidx, fn.body, fn.relsPerFunc, fn.offsPerFunc)
+		}
 	}
 
 	// Allocate executable memory and then copy the generated machine code.
