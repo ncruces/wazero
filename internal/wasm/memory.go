@@ -1,7 +1,6 @@
 package wasm
 
 import (
-	"container/list"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -33,8 +32,9 @@ const (
 var _ api.Memory = &MemoryInstance{}
 
 type waiters struct {
+	c   chan struct{}
+	n   int
 	mux sync.Mutex
-	l   *list.List
 }
 
 // MemoryInstance represents a memory instance in a store, and implements api.Memory.
@@ -376,13 +376,22 @@ func (m *MemoryInstance) writeUint64Le(offset uint32, v uint64) bool {
 
 // Wait32 suspends the caller until the offset is notified by a different agent.
 func (m *MemoryInstance) Wait32(offset uint32, exp uint32, timeout int64, reader func(mem *MemoryInstance, offset uint32) uint32) uint64 {
+	if timeout == 0 {
+		// We can avoid ever creating the waiters in the case.
+		cur := reader(m, offset)
+		if cur != exp {
+			return waitNotEqual
+		}
+		return waitOK
+	}
+
 	w := m.getWaiters(offset)
 	w.mux.Lock()
 
 	cur := reader(m, offset)
 	if cur != exp {
 		w.mux.Unlock()
-		return 1
+		return waitNotEqual
 	}
 
 	return m.wait(w, timeout)
@@ -390,52 +399,69 @@ func (m *MemoryInstance) Wait32(offset uint32, exp uint32, timeout int64, reader
 
 // Wait64 suspends the caller until the offset is notified by a different agent.
 func (m *MemoryInstance) Wait64(offset uint32, exp uint64, timeout int64, reader func(mem *MemoryInstance, offset uint32) uint64) uint64 {
+	if timeout == 0 {
+		// We can avoid ever creating the waiters in the case.
+		cur := reader(m, offset)
+		if cur != exp {
+			return waitNotEqual
+		}
+		return waitOK
+	}
+
 	w := m.getWaiters(offset)
 	w.mux.Lock()
 
 	cur := reader(m, offset)
 	if cur != exp {
 		w.mux.Unlock()
-		return 1
+		return waitNotEqual
 	}
 
 	return m.wait(w, timeout)
 }
 
 func (m *MemoryInstance) wait(w *waiters, timeout int64) uint64 {
-	if w.l == nil {
-		w.l = list.New()
+	if w.c == nil {
+		// The specification requires a trap if the number of existing waiters + 1 == 2^32.
+		// On 32-bits we can only have 2^31 waiters, but although a buffered chan struct{}
+		// uses constant memory, you're likely to exhaust other resources before
+		// you hit this limitation.
+		// https://github.com/WebAssembly/threads/blob/main/proposals/threads/Overview.md#wait
+		w.c = make(chan struct{}, min(math.MaxInt, math.MaxUint32))
 	}
 
-	// The specification requires a trap if the number of existing waiters + 1 == 2^32, so we add a check here.
-	// In practice, it is unlikely the application would ever accumulate such a large number of waiters as it
-	// indicates several GB of RAM used just for the list of waiters.
-	// https://github.com/WebAssembly/threads/blob/main/proposals/threads/Overview.md#wait
-	if uint64(w.l.Len()+1) == 1<<32 {
+	if w.n >= cap(w.c) {
 		w.mux.Unlock()
 		panic(wasmruntime.ErrRuntimeTooManyWaiters)
 	}
 
-	ready := make(chan struct{})
-	elem := w.l.PushBack(ready)
+	ready := w.c
+	w.n++
 	w.mux.Unlock()
 
 	if timeout < 0 {
 		<-ready
-		return 0
-	} else {
-		select {
-		case <-ready:
-			return 0
-		case <-time.After(time.Duration(timeout)):
-			// While we could see if the channel completed by now and ignore the timeout, similar to x/sync/semaphore,
-			// the Wasm spec doesn't specify this behavior, so we keep things simple by prioritizing the timeout.
-			w.mux.Lock()
-			w.l.Remove(elem)
-			w.mux.Unlock()
-			return 2
-		}
+		return waitOK
 	}
+
+	select {
+	case <-ready:
+		return waitOK
+	case <-time.After(time.Duration(timeout)):
+	}
+
+	// The specification promises that Notify wakes as many as count waiters.
+	// We need to check again under the lock if we have already been notified,
+	// and decrement N if we haven't.
+	w.mux.Lock()
+	defer w.mux.Unlock()
+
+	if w.n <= 0 {
+		<-ready
+		return waitOK
+	}
+	w.n--
+	return waitTimedOut
 }
 
 func (m *MemoryInstance) getWaiters(offset uint32) *waiters {
@@ -460,16 +486,18 @@ func (m *MemoryInstance) Notify(offset uint32, count uint32) uint32 {
 
 	w.mux.Lock()
 	defer w.mux.Unlock()
-	if w.l == nil {
-		return 0
-	}
 
 	res := uint32(0)
-	for num := w.l.Len(); num > 0 && res < count; num = w.l.Len() {
-		w := w.l.Remove(w.l.Front()).(chan struct{})
-		close(w)
+	for res < uint32(count) && w.n > 0 {
+		w.c <- struct{}{}
+		w.n--
 		res++
 	}
-
 	return res
 }
+
+const (
+	waitOK       = 0
+	waitNotEqual = 1
+	waitTimedOut = 2
+)
